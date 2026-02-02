@@ -18,6 +18,9 @@ export class PokemonGateway {
 
   private constructor() {
     this.app = express();
+    // FIX DO RENDER: Necessário para o rate-limit funcionar atrás do proxy do Render
+    this.app.set('trust proxy', 1);
+    
     this.cache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
     this.setupMiddleware();
     this.setupRoutes();
@@ -34,13 +37,17 @@ export class PokemonGateway {
     this.app.use(cors());
     this.app.use(express.json());
 
-    // Rate Limiting
+    // Rate Limiting Global
     const limiter = rateLimit({
       windowMs: 15 * 60 * 1000, 
       max: 100,
+      standardHeaders: true, // Retorna info de limite nos headers `RateLimit-*`
+      legacyHeaders: false, // Desabilita headers `X-RateLimit-*`
       message: "Muitas requisições deste IP, por favor tente novamente após 15 minutos."
     });
-    this.app.use('/api/', limiter);
+    
+    // Aplica o limitador em todas as rotas
+    this.app.use(limiter);
   }
 
   private setupRoutes() {
@@ -48,7 +55,8 @@ export class PokemonGateway {
       res.json(metrics.getMetrics());
     });
 
-    this.app.get('/api/pokemon/enriched/:nameOrId', async (req: Request, res: Response) => {
+    // ROTA SIMPLIFICADA (Para funcionar com o link curto)
+    this.app.get('/pokemon/:nameOrId', async (req: Request, res: Response) => {
       metrics.increment('totalRequests');
       const { nameOrId } = req.params;
       const lang = (req.query.lang as SupportedLanguage) || 'pt';
@@ -61,15 +69,24 @@ export class PokemonGateway {
 
       if (cachedData) {
         metrics.increment('cacheHits');
-        return res.json(cachedData);
+        return res.json({
+            raw: { name: nameOrId, source: 'cache_placeholder' }, // Simplificação para cache hit
+            enriched: cachedData 
+        });
       }
 
       metrics.increment('cacheMisses');
 
       try {
         // 2. Buscar Dados Brutos
-        const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
-        const pokemonData = pokemonRes.data;
+        // Adicionei tratamento de erro específico aqui caso o Pokemon não exista
+        let pokemonData;
+        try {
+            const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
+            pokemonData = pokemonRes.data;
+        } catch (err) {
+            return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
+        }
 
         // 3. Tentar Análise IA
         let analysisText: string;
@@ -125,6 +142,7 @@ export class PokemonGateway {
   }
 
   public start() {
+    // IMPORTANTE: O Render injeta a porta na variável PORT
     const PORT = process.env.PORT || 3000;
     this.app.listen(PORT, () => {
       console.log(`[Gateway Singleton] Rodando em http://localhost:${PORT}`);

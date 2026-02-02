@@ -1,0 +1,513 @@
+]633;E;tree src -I 'node_modules|dist|build|.git';6ca60f28-0d4c-4ebd-81fd-9a83ff79df01]633;Ctree is not installed, but available in the following packages, pick one to run it, Ctrl+C to cancel.
+
+===== src/index.ts =====
+import express from 'express';
+import { fetchPokemonList, fetchPokemonDetails } from './services/poke-api';
+import { getProfessorInsight, generatePokemonSpeech } from './services/aiService';
+
+const app = express();
+const port = 3000;
+
+app.use(express.json());
+
+app.get('/pokemon', async (req, res) => {
+  try {
+    const pokemonList = await fetchPokemonList();
+    res.json(pokemonList);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch Pokémon list' });
+  }
+});
+
+app.get('/pokemon/:name', async (req, res) => {
+  try {
+    const pokemonDetails = await fetchPokemonDetails(req.params.name);
+    // A função getProfessorInsight agora espera um objeto AnalysisRequest
+    const professorInsight = await getProfessorInsight({ pokemon: pokemonDetails });
+    res.json({ ...pokemonDetails, professorInsight });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch Pokémon details' });
+  }
+});
+
+app.post('/pokemon/speech', async (req, res) => {
+  try {
+    const { text } = req.body;
+    const audioContent = await generatePokemonSpeech(text);
+    res.json({ audioContent });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to generate speech' });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Gateway is running on http://localhost:${port}`);
+});
+
+===== src/services/poke-api.ts =====
+
+    import { PokemonBase, PokemonDetails } from '../types';
+
+    const BASE_URL = 'https://pokeapi.co/api/v2';
+
+    export const fetchPokemonList = async (limit: number = 151, offset: number = 0): Promise<PokemonBase[]> => {
+      const response = await fetch(`${BASE_URL}/pokemon?limit=${limit}&offset=${offset}`);
+      if (!response.ok) throw new Error('Failed to fetch pokemon list');
+      const data = await response.json();
+      return data.results;
+    };
+
+    export const fetchPokemonDetails = async (nameOrId: string | number): Promise<PokemonDetails> => {
+      const response = await fetch(`${BASE_URL}/pokemon/${nameOrId}`);
+      if (!response.ok) throw new Error('Failed to fetch pokemon details');
+      return await response.json();
+    };
+    
+===== src/services/pokemonService.ts =====
+import { PokemonBase, PokemonDetails } from '../types';
+
+const BASE_URL = 'https://pokeapi.co/api/v2';
+
+export const fetchPokemonList = async (limit: number = 151, offset: number = 0): Promise<PokemonBase[]> => {
+  const response = await fetch(`${BASE_URL}/pokemon?limit=${limit}&offset=${offset}`);
+  if (!response.ok) throw new Error('Failed to fetch pokemon list');
+  const data = await response.json();
+  return data.results;
+};
+
+export const fetchPokemonDetails = async (nameOrId: string | number): Promise<PokemonDetails> => {
+  const response = await fetch(`${BASE_URL}/pokemon/${nameOrId}`);
+  if (!response.ok) throw new Error('Failed to fetch pokemon details');
+  return await response.json();
+};
+===== src/services/aiService.ts =====
+import axios from 'axios';
+import { AnalysisRequest, SupportedLanguage } from "../types";
+
+const getSystemPrompt = (lang: SupportedLanguage, format: string) => {
+  const langMap = { pt: 'PORTUGUÊS', en: 'INGLÊS', es: 'ESPANHOL' };
+  const formatInstructions = format === 'html' 
+    ? 'Use tags HTML (<b>, <i>, <br>, <ul>, <li>) para formatação.' 
+    : 'Use Markdown padrão.';
+    
+  return `Você é o Professor Carvalho. Responda OBRIGATORIAMENTE em ${langMap[lang] || 'PORTUGUÊS'}. ${formatInstructions}`;
+};
+
+export const getProfessorInsight = async (req: AnalysisRequest): Promise<{ text: string, model: string }> => {
+  const { pokemon, lang = 'pt', format = 'markdown', model = 'flash' } = req;
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) {
+    throw new Error("API_KEY environment variable not set");
+  }
+
+  // Modelos e URL a partir de variáveis de ambiente
+  const proModel = process.env.GEMINI_PRO_MODEL || 'gemini-1.5-pro-latest';
+  const flashModel = process.env.GEMINI_FLASH_MODEL || 'gemini-1.5-flash-latest';
+  const modelName = model === 'pro' ? proModel : flashModel;
+  const baseUrl = process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com/v1beta/models';
+  const url = `${baseUrl}/${modelName}:generateContent?key=${apiKey}`;
+
+  const statsString = pokemon.stats.map(s => `${s.stat.name}: ${s.base_stat}`).join(', ');
+  const typesString = pokemon.types.map(t => t.type.name).join(', ');
+  const abilitiesString = pokemon.abilities.map(a => a.ability.name).join(', ');
+
+  const systemPrompt = getSystemPrompt(lang, format);
+  const userPrompt = `Analise o Pokémon ${pokemon.name.toUpperCase()}.\nTipos: ${typesString}\nAtributos: ${statsString}\nHabilidades: ${abilitiesString}\n\nInclua:\n1. Dica Estratégica.\n2. Curiosidade (Lore).`;
+
+  const requestBody = {
+    contents: [{
+      parts: [{ text: userPrompt }]
+    }],
+    systemInstruction: {
+      parts: [{ text: systemPrompt }]
+    }
+  };
+
+  try {
+    const response = await axios.post(url, requestBody, { headers: { 'Content-Type': 'application/json' } });
+    
+    if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+      const text = response.data.candidates[0].content.parts[0].text;
+      return { text, model: modelName };
+    } else {
+      console.error("Unexpected AI response structure:", response.data);
+      throw new Error("Unexpected AI response structure.");
+    }
+
+  } catch (error) {
+    const axiosError = error as any;
+    console.error("AI Service Error:", axiosError.response ? axiosError.response.data : axiosError.message);
+    throw axiosError;
+  }
+};
+
+export const generatePokemonSpeech = async (text: string): Promise<string> => {
+    const apiKey = process.env.API_KEY;
+    if (!apiKey) {
+        throw new Error("API_KEY environment variable not set");
+    }
+    
+    const ttsModel = process.env.GEMINI_TTS_MODEL || 'text-to-speech-2';
+    const baseUrl = process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com/v1beta/models';
+    const url = `${baseUrl}/${ttsModel}:generateContent?key=${apiKey}`;
+
+    const requestBody = {
+        "contents": [{
+            "parts": [{ "text": text }]
+        }],
+        "generationConfig": {
+            "responseMimeType": "audio/mpeg"
+        }
+    };
+
+    try {
+        const response = await axios.post(url, requestBody, { headers: { 'Content-Type': 'application/json' } });
+
+        if (response.data?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data) {
+            return response.data.candidates[0].content.parts[0].inlineData.data;
+        } else {
+            console.error("Unexpected TTS response structure:", response.data);
+            throw new Error("Unexpected TTS response structure.");
+        }
+    } catch (error) {
+        const axiosError = error as any;
+        console.error("TTS Service Error:", axiosError.response ? axiosError.response.data : axiosError.message);
+        throw axiosError;
+    }
+};
+
+===== src/gateway/index.ts =====
+import { PokemonGateway } from './app';
+
+// Inicia a instância única
+const gateway = PokemonGateway.getInstance();
+gateway.start();
+===== src/gateway/app.ts =====
+import express, { Request, Response, Application } from 'express';
+import axios from 'axios';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import NodeCache from 'node-cache';
+import { getProfessorInsight, generatePokemonSpeech } from '../services/aiService';
+import { getFallbackAnalysis } from '../utils/fallback';
+import { metrics } from '../utils/metrics';
+import { AnalysisRequest, AnalysisResponse, SupportedLanguage, SupportedFormat } from '../types';
+
+// Configuração do Singleton
+export class PokemonGateway {
+  private static instance: PokemonGateway;
+  private app: Application;
+  private cache: NodeCache;
+  private POKEMON_SERVICE_URL = process.env.POKEMON_SERVICE_URL || 'http://localhost:3001';
+  private AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:3002';
+
+  private constructor() {
+    this.app = express();
+    // FIX DO RENDER: Necessário para o rate-limit funcionar atrás do proxy do Render
+    this.app.set('trust proxy', 1);
+    
+    this.cache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
+    this.setupMiddleware();
+    this.setupRoutes();
+  }
+
+  public static getInstance(): PokemonGateway {
+    if (!PokemonGateway.instance) {
+      PokemonGateway.instance = new PokemonGateway();
+    }
+    return PokemonGateway.instance;
+  }
+
+  private setupMiddleware() {
+    this.app.use(cors());
+    this.app.use(express.json());
+
+    // Rate Limiting Global
+    const limiter = rateLimit({
+      windowMs: 15 * 60 * 1000, 
+      max: 100,
+      standardHeaders: true, // Retorna info de limite nos headers `RateLimit-*`
+      legacyHeaders: false, // Desabilita headers `X-RateLimit-*`
+      message: "Muitas requisições deste IP, por favor tente novamente após 15 minutos."
+    });
+    
+    // Aplica o limitador em todas as rotas
+    this.app.use(limiter);
+  }
+
+  private setupRoutes() {
+    this.app.get('/metrics', (req: Request, res: Response) => {
+      res.json(metrics.getMetrics());
+    });
+
+    // ROTA SIMPLIFICADA (Para funcionar com o link curto)
+    this.app.get('/pokemon/:nameOrId', async (req: Request, res: Response) => {
+      metrics.increment('totalRequests');
+      const { nameOrId } = req.params;
+      const lang = (req.query.lang as SupportedLanguage) || 'pt';
+      const format = (req.query.format as SupportedFormat) || 'markdown';
+      const generateAudio = req.query.audio === 'true';
+
+      // 1. Checar Cache
+      const cacheKey = `${nameOrId}-${lang}-${format}`;
+      const cachedData = this.cache.get<AnalysisResponse>(cacheKey);
+
+      if (cachedData) {
+        metrics.increment('cacheHits');
+        return res.json({
+            raw: { name: nameOrId, source: 'cache_placeholder' }, // Simplificação para cache hit
+            enriched: cachedData 
+        });
+      }
+
+      metrics.increment('cacheMisses');
+
+      try {
+        // 2. Buscar Dados Brutos
+        // Adicionei tratamento de erro específico aqui caso o Pokemon não exista
+        let pokemonData;
+        try {
+            const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
+            pokemonData = pokemonRes.data;
+        } catch (err) {
+            return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
+        }
+
+        // 3. Tentar Análise IA
+        let analysisText: string;
+        let source: AnalysisResponse['source'] = 'ai';
+        let modelUsed = '';
+
+        try {
+          const aiResult = await getProfessorInsight({ pokemon: pokemonData, lang, format });
+          analysisText = aiResult.text;
+          modelUsed = aiResult.model;
+        } catch (aiError) {
+          console.error(`[Gateway] AI Failed for ${nameOrId}, using Fallback.`);
+          metrics.increment('aiErrors');
+          metrics.increment('fallbacksUsed');
+          analysisText = getFallbackAnalysis(pokemonData, lang);
+          source = 'fallback';
+          modelUsed = 'fallback-template';
+        }
+
+        // 4. Gerar Áudio (opcional)
+        let audioBase64: string | undefined;
+        if (generateAudio) {
+          try {
+            audioBase64 = await generatePokemonSpeech(analysisText);
+          } catch (e) {
+            console.error("Audio gen failed, continuing without audio.");
+          }
+        }
+
+        // 5. Montar Resposta
+        const responsePayload: AnalysisResponse = {
+          pokemonName: pokemonData.name,
+          text: analysisText,
+          audioBase64,
+          source,
+          modelUsed,
+          lang
+        };
+
+        this.cache.set(cacheKey, responsePayload);
+        
+        // Resposta Envelopada
+        res.json({
+          raw: pokemonData,
+          enriched: responsePayload
+        });
+
+      } catch (error: any) {
+        console.error("Gateway Critical Error:", error);
+        res.status(500).json({ error: "Falha interna no Gateway", details: error.message });
+      }
+    });
+  }
+
+  public start() {
+    // IMPORTANTE: O Render injeta a porta na variável PORT
+    const PORT = process.env.PORT || 3000;
+    this.app.listen(PORT, () => {
+      console.log(`[Gateway Singleton] Rodando em http://localhost:${PORT}`);
+    });
+  }
+}
+===== src/microservices/ai.server.ts =====
+import express, { Request, Response } from 'express';
+import cors from 'cors';
+import { getProfessorInsight, generatePokemonSpeech } from '../services/aiService';
+import { PokemonDetails } from '../types';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = 3002;
+
+app.post('/ai/insight', async (req: Request, res: Response) => {
+  try {
+    const reqData = req.body; // Espera { pokemon, lang, format, model }
+    const pokemon: PokemonDetails = reqData.pokemon;
+    const text = await getProfessorInsight(reqData);
+    res.json({ insight: text.text, model: text.model });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao gerar insight" });
+  }
+});
+
+app.post('/ai/speech', async (req: Request, res: Response) => {
+  try {
+    const { text } = req.body;
+    const audioBase64 = await generatePokemonSpeech(text);
+    res.json({ audio: audioBase64 });
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao gerar áudio" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`[AI Service] Rodando em http://localhost:${PORT}`);
+});
+===== src/microservices/pokemon.server.ts =====
+import express, { Request, Response } from 'express';
+import cors from 'cors';
+import { fetchPokemonList, fetchPokemonDetails } from '../services/pokemonService';
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const PORT = 3001;
+
+app.get('/pokemon', async (req: Request, res: Response) => {
+  try {
+    const { limit, offset } = req.query;
+    const list = await fetchPokemonList(Number(limit), Number(offset));
+    res.json(list);
+  } catch (error) {
+    res.status(500).json({ error: "Erro ao buscar lista de Pokémon" });
+  }
+});
+
+app.get('/pokemon/:nameOrId', async (req: Request, res: Response) => {
+  try {
+    const { nameOrId } = req.params;
+    const details = await fetchPokemonDetails(nameOrId);
+    res.json(details);
+  } catch (error) {
+    res.status(404).json({ error: "Pokémon não encontrado" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`[Pokemon Service] Rodando em http://localhost:${PORT}`);
+});
+===== src/utils/fallback.ts =====
+import { PokemonDetails, SupportedLanguage } from '../types';
+
+const getTemplate = (lang: SupportedLanguage, name: string, type: string) => {
+  const templates = {
+    pt: `### Análise de Emergência: ${name}\n\nOs sistemas do Professor estão instáveis. Dados básicos:\n- **Tipo:** ${type}\n- **Estratégia:** Monitore os atributos básicos.\n- **Lore:** Sem dados de lore disponíveis no momento offline.`,
+    en: `### Emergency Analysis: ${name}\n\nProfessor's systems unstable. Basic data:\n- **Type:** ${type}\n- **Strategy:** Watch base stats closely.\n- **Lore:** No lore data available offline.`,
+    es: `### Análisis de Emergência: ${name}\n\nSistemas del Profesor inestables. Datos básicos:\n- **Tipo:** ${type}\n- **Estrategia:** Monitorea los atributos básicos.\n- **Lore:** Sin datos de historia disponibles offline.`
+  };
+  return templates[lang];
+};
+
+export const getFallbackAnalysis = (pokemon: PokemonDetails, lang: SupportedLanguage = 'pt'): string => {
+  const type = pokemon.types[0]?.type.name || 'unknown';
+  return getTemplate(lang, pokemon.name, type);
+};
+===== src/utils/metrics.ts =====
+import { ServiceMetrics } from '../types';
+
+class Metrics {
+  private metrics: ServiceMetrics = {
+    totalRequests: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+    aiErrors: 0,
+    fallbacksUsed: 0,
+  };
+
+  public increment(type: keyof ServiceMetrics) {
+    this.metrics[type]++;
+  }
+
+  public getMetrics(): ServiceMetrics {
+    return { ...this.metrics };
+  }
+
+  public reset() {
+    this.metrics = {
+      totalRequests: 0, cacheHits: 0, cacheMisses: 0, aiErrors: 0, fallbacksUsed: 0
+    };
+  }
+}
+
+export const metrics = new Metrics();
+===== src/types.ts =====
+// Interfaces de Dados da PokeAPI
+export interface Stat {
+  base_stat: number;
+  effort: number;
+  stat: { name: string; url: string };
+}
+
+export interface Ability {
+  ability: { name: string; url: string };
+  is_hidden: boolean;
+  slot: number;
+}
+
+export interface Type {
+  slot: number;
+  type: { name: string; url: string };
+}
+
+export interface PokemonDetails {
+  id: number;
+  name: string;
+  stats: Stat[];
+  types: Type[];
+  abilities: Ability[];
+  height: number;
+  weight: number;
+  sprites: { front_default: string };
+}
+
+export interface PokemonBase {
+  name: string;
+  url: string;
+}
+
+// Interfaces do Sistema de Gateway
+export type SupportedLanguage = 'pt' | 'en' | 'es';
+export type SupportedFormat = 'markdown' | 'html' | 'text';
+export type ModelType = 'flash' | 'pro';
+
+export interface AnalysisRequest {
+  pokemon: PokemonDetails;
+  lang?: SupportedLanguage;
+  format?: SupportedFormat;
+  model?: ModelType;
+}
+
+export interface AnalysisResponse {
+  pokemonName: string;
+  text: string;
+  audioBase64?: string;
+  source: 'ai' | 'cache' | 'fallback';
+  modelUsed: string;
+  lang: SupportedLanguage;
+}
+
+export interface ServiceMetrics {
+  totalRequests: number;
+  cacheHits: number;
+  cacheMisses: number;
+  aiErrors: number;
+  fallbacksUsed: number;
+}
