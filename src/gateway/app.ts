@@ -18,10 +18,10 @@ export class PokemonGateway {
 
   private constructor() {
     this.app = express();
-    // FIX DO RENDER: Necessário para o rate-limit funcionar atrás do proxy do Render
     this.app.set('trust proxy', 1);
     
-    this.cache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
+    // Cache mais longo para dados de Pokémon (não mudam)
+    this.cache = new NodeCache({ stdTTL: 3600, checkperiod: 300 });
     this.setupMiddleware();
     this.setupRoutes();
   }
@@ -37,32 +37,86 @@ export class PokemonGateway {
     this.app.use(cors());
     this.app.use(express.json());
 
-    // Rate Limiting Global
+    // Rate Limiting MAIS PERMISSIVO
     const limiter = rateLimit({
-      windowMs: 15 * 60 * 1000, 
-      max: 100,
+      windowMs: 1 * 60 * 1000, // 1 minuto (reduzido de 15)
+      max: 200, // 200 requests por minuto (aumentado de 100)
       standardHeaders: true,
       legacyHeaders: false,
-      message: "Muitas requisições deste IP, por favor tente novamente após 15 minutos."
+      message: "Muitas requisições. Aguarde um momento.",
+      // Skip para rotas de dados básicos (não IA)
+      skip: (req) => {
+        return req.path.includes('/details') || 
+               req.path === '/pokemon' || 
+               req.path === '/health';
+      }
     });
     
     this.app.use(limiter);
   }
 
   private setupRoutes() {
-    // ==================== ROTAS DE SISTEMA ====================
-    
+    // Health check
     this.app.get('/health', (req: Request, res: Response) => {
       res.json({ status: 'ok', timestamp: new Date().toISOString() });
     });
 
+    // Métricas
     this.app.get('/metrics', (req: Request, res: Response) => {
       res.json(metrics.getMetrics());
     });
 
-    // ==================== ROTAS DE POKÉMON ====================
-    
-    // Lista de Pokémon (sem análise IA)
+    // ==================== NOVA ROTA: BATCH DE DETALHES ====================
+    // Para carregar vários Pokémon de uma vez (evita rate limit)
+    this.app.post('/pokemon/batch', async (req: Request, res: Response) => {
+      try {
+        const { names } = req.body; // Array de nomes: ['pikachu', 'charmander']
+        
+        if (!Array.isArray(names) || names.length === 0) {
+          return res.status(400).json({ error: "Campo 'names' deve ser um array não vazio" });
+        }
+
+        if (names.length > 50) {
+          return res.status(400).json({ error: "Máximo de 50 pokémon por batch" });
+        }
+
+        const results = await Promise.allSettled(
+          names.map(async (name) => {
+            const cacheKey = `details-${name}`;
+            const cached = this.cache.get(cacheKey);
+            
+            if (cached) {
+              return { name, data: cached, source: 'cache' };
+            }
+
+            const response = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${name}`);
+            this.cache.set(cacheKey, response.data);
+            return { name, data: response.data, source: 'api' };
+          })
+        );
+
+        const successful = results
+          .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled')
+          .map(r => r.value);
+
+        const failed = results
+          .map((r, i) => r.status === 'rejected' ? names[i] : null)
+          .filter(Boolean);
+
+        res.json({ 
+          success: successful,
+          failed,
+          total: names.length,
+          successCount: successful.length
+        });
+
+      } catch (error: any) {
+        console.error("Batch error:", error.message);
+        res.status(500).json({ error: "Erro no carregamento em lote" });
+      }
+    });
+
+    // Lista de Pokémon
     this.app.get('/pokemon', async (req: Request, res: Response) => {
       try {
         const { limit = 151, offset = 0 } = req.query;
@@ -78,7 +132,7 @@ export class PokemonGateway {
           `${this.POKEMON_SERVICE_URL}/pokemon?limit=${limit}&offset=${offset}`
         );
         
-        this.cache.set(cacheKey, pokemonRes.data);
+        this.cache.set(cacheKey, pokemonRes.data, 7200); // Cache por 2 horas
         res.json(pokemonRes.data);
       } catch (error: any) {
         console.error("Error fetching pokemon list:", error.message);
@@ -86,7 +140,7 @@ export class PokemonGateway {
       }
     });
 
-    // Detalhes básicos do Pokémon (sem análise IA)
+    // Detalhes básicos do Pokémon (SEM rate limit rigoroso)
     this.app.get('/pokemon/:nameOrId/details', async (req: Request, res: Response) => {
       try {
         const { nameOrId } = req.params;
@@ -100,16 +154,14 @@ export class PokemonGateway {
 
         const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
         
-        this.cache.set(cacheKey, pokemonRes.data);
+        this.cache.set(cacheKey, pokemonRes.data, 7200); // Cache longo
         res.json(pokemonRes.data);
       } catch (err) {
         return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
       }
     });
 
-    // ==================== ROTAS DE IA ====================
-    
-    // Análise do Professor (APENAS TEXTO)
+    // Análise do Professor (COM rate limit)
     this.app.get('/pokemon/:nameOrId/insight', async (req: Request, res: Response) => {
       metrics.increment('totalRequests');
       const { nameOrId } = req.params;
@@ -117,7 +169,6 @@ export class PokemonGateway {
       const format = (req.query.format as SupportedFormat) || 'markdown';
       const model = (req.query.model as 'flash' | 'pro') || 'flash';
 
-      // 1. Checar Cache
       const cacheKey = `insight-${nameOrId}-${lang}-${format}-${model}`;
       const cachedInsight = this.cache.get<{ text: string; modelUsed: string; source: string }>(cacheKey);
 
@@ -129,7 +180,6 @@ export class PokemonGateway {
       metrics.increment('cacheMisses');
 
       try {
-        // 2. Buscar dados do Pokémon
         let pokemonData;
         try {
           const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
@@ -138,7 +188,6 @@ export class PokemonGateway {
           return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
         }
 
-        // 3. Gerar análise
         let analysisText: string;
         let source: 'ai' | 'fallback' = 'ai';
         let modelUsed = '';
@@ -173,7 +222,7 @@ export class PokemonGateway {
       }
     });
 
-    // Gerar Áudio (APENAS ÁUDIO)
+    // Gerar Áudio
     this.app.post('/ai/speech', async (req: Request, res: Response) => {
       try {
         const { text } = req.body;
@@ -182,7 +231,6 @@ export class PokemonGateway {
           return res.status(400).json({ error: "Campo 'text' é obrigatório e deve ser uma string" });
         }
 
-        // Cache baseado no hash do texto (opcional, áudio pode ser pesado)
         const textHash = Buffer.from(text).toString('base64').substring(0, 32);
         const cacheKey = `audio-${textHash}`;
         const cachedAudio = this.cache.get<string>(cacheKey);
@@ -192,8 +240,6 @@ export class PokemonGateway {
         }
 
         const audioBase64 = await generatePokemonSpeech(text);
-        
-        // Cache por 10 minutos
         this.cache.set(cacheKey, audioBase64, 600);
         
         res.json({ audio: audioBase64, source: 'generated' });
@@ -203,9 +249,7 @@ export class PokemonGateway {
       }
     });
 
-    // ==================== ROTA COMBINADA (OPCIONAL/LEGADO) ====================
-    
-    // Detalhes + Análise + Áudio (tudo de uma vez, para compatibilidade)
+    // Rota combinada (legado)
     this.app.get('/pokemon/:nameOrId', async (req: Request, res: Response) => {
       metrics.increment('totalRequests');
       const { nameOrId } = req.params;
@@ -228,7 +272,6 @@ export class PokemonGateway {
       metrics.increment('cacheMisses');
 
       try {
-        // 1. Buscar dados
         let pokemonData;
         try {
           const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
@@ -237,7 +280,6 @@ export class PokemonGateway {
           return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
         }
 
-        // 2. Gerar análise
         let analysisText: string;
         let source: AnalysisResponse['source'] = 'ai';
         let modelUsed = '';
@@ -255,7 +297,6 @@ export class PokemonGateway {
           modelUsed = 'fallback-template';
         }
 
-        // 3. Gerar áudio (opcional)
         let audioBase64: string | undefined;
         if (generateAudio) {
           try {
