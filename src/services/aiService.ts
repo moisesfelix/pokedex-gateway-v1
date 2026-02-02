@@ -52,7 +52,7 @@ Mantenha um tom encorajador, sábio e acadêmico. Use markdown para formatação
   try {
     // ✅ Chamada para a API do Gemini com modelo correto
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-exp', // ✅ Modelo válido
+      model: 'gemini-3-flash-preview',
       contents: prompt,
     });
 
