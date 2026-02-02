@@ -1,0 +1,16 @@
+src
+src/gateway
+src/gateway/app.ts
+src/gateway/index.ts
+src/microservices
+src/microservices/ai.server.ts
+src/microservices/pokemon.server.ts
+src/services
+src/services/aiService.ts
+src/services/pokemonService.ts
+src/types.ts
+src/utils
+src/utils/fallback.ts
+src/utils/metrics.ts
+
+5 directories, 9 files

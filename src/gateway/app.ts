@@ -3,10 +3,10 @@ import axios from 'axios';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import NodeCache from 'node-cache';
-import { getProfessorInsight, generatePokemonSpeech } from '../services/aiService';
+import { getProfessorInsight } from '../services/aiService'; // ← Removido generatePokemonSpeech
 import { getFallbackAnalysis } from '../utils/fallback';
 import { metrics } from '../utils/metrics';
-import { AnalysisRequest, AnalysisResponse, SupportedLanguage, SupportedFormat } from '../types';
+import { AnalysisResponse, SupportedLanguage, SupportedFormat, PokemonDetails } from '../types';
 
 // Configuração do Singleton
 export class PokemonGateway {
@@ -19,8 +19,7 @@ export class PokemonGateway {
   private constructor() {
     this.app = express();
     this.app.set('trust proxy', 1);
-    
-    // Cache mais longo para dados de Pokémon (não mudam)
+
     this.cache = new NodeCache({ stdTTL: 3600, checkperiod: 300 });
     this.setupMiddleware();
     this.setupRoutes();
@@ -37,41 +36,36 @@ export class PokemonGateway {
     this.app.use(cors());
     this.app.use(express.json());
 
-    // Rate Limiting MAIS PERMISSIVO
     const limiter = rateLimit({
-      windowMs: 1 * 60 * 1000, // 1 minuto (reduzido de 15)
-      max: 200, // 200 requests por minuto (aumentado de 100)
+      windowMs: 1 * 60 * 1000,
+      max: 200,
       standardHeaders: true,
       legacyHeaders: false,
       message: "Muitas requisições. Aguarde um momento.",
-      // Skip para rotas de dados básicos (não IA)
       skip: (req) => {
-        return req.path.includes('/details') || 
-               req.path === '/pokemon' || 
-               req.path === '/health';
+        return req.path.includes('/details') ||
+          req.path === '/pokemon' ||
+          req.path === '/health';
       }
     });
-    
+
     this.app.use(limiter);
   }
 
   private setupRoutes() {
-    // Health check
     this.app.get('/health', (req: Request, res: Response) => {
       res.json({ status: 'ok', timestamp: new Date().toISOString() });
     });
 
-    // Métricas
     this.app.get('/metrics', (req: Request, res: Response) => {
       res.json(metrics.getMetrics());
     });
 
-    // ==================== NOVA ROTA: BATCH DE DETALHES ====================
-    // Para carregar vários Pokémon de uma vez (evita rate limit)
+    // Batch de detalhes
     this.app.post('/pokemon/batch', async (req: Request, res: Response) => {
       try {
-        const { names } = req.body; // Array de nomes: ['pikachu', 'charmander']
-        
+        const { names } = req.body;
+
         if (!Array.isArray(names) || names.length === 0) {
           return res.status(400).json({ error: "Campo 'names' deve ser um array não vazio" });
         }
@@ -81,15 +75,16 @@ export class PokemonGateway {
         }
 
         const results = await Promise.allSettled(
-          names.map(async (name) => {
-            const cacheKey = `details-${name}`;
+          names.map(async (name: string) => {
+            const normalized = name.toLowerCase();
+            const cacheKey = `details-${normalized}`;
             const cached = this.cache.get(cacheKey);
-            
+
             if (cached) {
               return { name, data: cached, source: 'cache' };
             }
 
-            const response = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${name}`);
+            const response = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${normalized}`);
             this.cache.set(cacheKey, response.data);
             return { name, data: response.data, source: 'api' };
           })
@@ -103,7 +98,7 @@ export class PokemonGateway {
           .map((r, i) => r.status === 'rejected' ? names[i] : null)
           .filter(Boolean);
 
-        res.json({ 
+        res.json({
           success: successful,
           failed,
           total: names.length,
@@ -120,10 +115,10 @@ export class PokemonGateway {
     this.app.get('/pokemon', async (req: Request, res: Response) => {
       try {
         const { limit = 151, offset = 0 } = req.query;
-        
+
         const cacheKey = `list-${limit}-${offset}`;
         const cachedList = this.cache.get(cacheKey);
-        
+
         if (cachedList) {
           return res.json(cachedList);
         }
@@ -131,8 +126,8 @@ export class PokemonGateway {
         const pokemonRes = await axios.get(
           `${this.POKEMON_SERVICE_URL}/pokemon?limit=${limit}&offset=${offset}`
         );
-        
-        this.cache.set(cacheKey, pokemonRes.data, 7200); // Cache por 2 horas
+
+        this.cache.set(cacheKey, pokemonRes.data, 7200);
         res.json(pokemonRes.data);
       } catch (error: any) {
         console.error("Error fetching pokemon list:", error.message);
@@ -140,37 +135,51 @@ export class PokemonGateway {
       }
     });
 
-    // Detalhes básicos do Pokémon (SEM rate limit rigoroso)
+    // Detalhes básicos do Pokémon
     this.app.get('/pokemon/:nameOrId/details', async (req: Request, res: Response) => {
+      metrics.increment('totalRequests');
+
       try {
         const { nameOrId } = req.params;
-        
-        const cacheKey = `details-${nameOrId}`;
-        const cachedDetails = this.cache.get(cacheKey);
-        
+        const normalizedName = nameOrId.toLowerCase();
+        const cacheKey = `details-${normalizedName}`;
+
+        const cachedDetails = this.cache.get<PokemonDetails>(cacheKey);
+
         if (cachedDetails) {
+          metrics.increment('cacheHits');
           return res.json(cachedDetails);
         }
 
-        const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
-        
-        this.cache.set(cacheKey, pokemonRes.data, 7200); // Cache longo
-        res.json(pokemonRes.data);
-      } catch (err) {
-        return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
+        metrics.increment('cacheMisses');
+
+        const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${normalizedName}`);
+        const pokemonData = pokemonRes.data as PokemonDetails;
+
+        this.cache.set(cacheKey, pokemonData, 7200);
+
+        res.json(pokemonData);
+      } catch (err: any) {
+        if (err.response?.status === 404) {
+          return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
+        }
+
+        console.error("Error fetching pokemon details:", err.message);
+        res.status(500).json({ error: "Erro ao buscar detalhes do Pokémon" });
       }
     });
 
-    // Análise do Professor (COM rate limit)
+    // Análise do Professor
     this.app.get('/pokemon/:nameOrId/insight', async (req: Request, res: Response) => {
       metrics.increment('totalRequests');
       const { nameOrId } = req.params;
       const lang = (req.query.lang as SupportedLanguage) || 'pt';
-      const format = (req.query.format as SupportedFormat) || 'markdown';
-      const model = (req.query.model as 'flash' | 'pro') || 'flash';
+      // format e model não são usados no momento (compatibilidade com assinatura antiga da AI)
+      // const format = (req.query.format as SupportedFormat) || 'markdown';
+      // const model = (req.query.model as 'flash' | 'pro') || 'flash';
 
-      const cacheKey = `insight-${nameOrId}-${lang}-${format}-${model}`;
-      const cachedInsight = this.cache.get<{ text: string; modelUsed: string; source: string }>(cacheKey);
+      const cacheKey = `insight-${nameOrId.toLowerCase()}-${lang}`;
+      const cachedInsight = this.cache.get<AnalysisResponse>(cacheKey);
 
       if (cachedInsight) {
         metrics.increment('cacheHits');
@@ -180,7 +189,7 @@ export class PokemonGateway {
       metrics.increment('cacheMisses');
 
       try {
-        let pokemonData;
+        let pokemonData: PokemonDetails;
         try {
           const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
           pokemonData = pokemonRes.data;
@@ -190,12 +199,11 @@ export class PokemonGateway {
 
         let analysisText: string;
         let source: 'ai' | 'fallback' = 'ai';
-        let modelUsed = '';
+        let modelUsed = 'gemini'; // valor fixo enquanto usamos assinatura antiga
 
         try {
-          const aiResult = await getProfessorInsight({ pokemon: pokemonData, lang, format, model });
-          analysisText = aiResult.text;
-          modelUsed = aiResult.model;
+          // Chamada compatível com assinatura antiga: getProfessorInsight(pokemon: PokemonDetails): Promise<string>
+          analysisText = await getProfessorInsight(pokemonData);
         } catch (aiError) {
           console.error(`[Gateway] AI Failed for ${nameOrId}, using Fallback.`);
           metrics.increment('aiErrors');
@@ -205,7 +213,7 @@ export class PokemonGateway {
           modelUsed = 'fallback-template';
         }
 
-        const response = {
+        const response: AnalysisResponse = {
           pokemonName: pokemonData.name,
           text: analysisText,
           source,
@@ -222,111 +230,8 @@ export class PokemonGateway {
       }
     });
 
-    // Gerar Áudio
-    this.app.post('/ai/speech', async (req: Request, res: Response) => {
-      try {
-        const { text } = req.body;
-        
-        if (!text || typeof text !== 'string') {
-          return res.status(400).json({ error: "Campo 'text' é obrigatório e deve ser uma string" });
-        }
-
-        const textHash = Buffer.from(text).toString('base64').substring(0, 32);
-        const cacheKey = `audio-${textHash}`;
-        const cachedAudio = this.cache.get<string>(cacheKey);
-
-        if (cachedAudio) {
-          return res.json({ audio: cachedAudio, source: 'cache' });
-        }
-
-        const audioBase64 = await generatePokemonSpeech(text);
-        this.cache.set(cacheKey, audioBase64, 600);
-        
-        res.json({ audio: audioBase64, source: 'generated' });
-      } catch (error: any) {
-        console.error("Speech generation error:", error.message);
-        res.status(500).json({ error: "Erro ao gerar áudio", details: error.message });
-      }
-    });
-
-    // Rota combinada (legado)
-    this.app.get('/pokemon/:nameOrId', async (req: Request, res: Response) => {
-      metrics.increment('totalRequests');
-      const { nameOrId } = req.params;
-      const lang = (req.query.lang as SupportedLanguage) || 'pt';
-      const format = (req.query.format as SupportedFormat) || 'markdown';
-      const generateAudio = req.query.audio === 'true';
-      const model = (req.query.model as 'flash' | 'pro') || 'flash';
-
-      const cacheKey = `full-${nameOrId}-${lang}-${format}-${generateAudio}-${model}`;
-      const cachedData = this.cache.get<AnalysisResponse>(cacheKey);
-
-      if (cachedData) {
-        metrics.increment('cacheHits');
-        return res.json({
-          raw: { name: nameOrId, source: 'cache_placeholder' },
-          enriched: cachedData 
-        });
-      }
-
-      metrics.increment('cacheMisses');
-
-      try {
-        let pokemonData;
-        try {
-          const pokemonRes = await axios.get(`${this.POKEMON_SERVICE_URL}/pokemon/${nameOrId}`);
-          pokemonData = pokemonRes.data;
-        } catch (err) {
-          return res.status(404).json({ error: "Pokémon não encontrado na PokeAPI" });
-        }
-
-        let analysisText: string;
-        let source: AnalysisResponse['source'] = 'ai';
-        let modelUsed = '';
-
-        try {
-          const aiResult = await getProfessorInsight({ pokemon: pokemonData, lang, format, model });
-          analysisText = aiResult.text;
-          modelUsed = aiResult.model;
-        } catch (aiError) {
-          console.error(`[Gateway] AI Failed for ${nameOrId}, using Fallback.`);
-          metrics.increment('aiErrors');
-          metrics.increment('fallbacksUsed');
-          analysisText = getFallbackAnalysis(pokemonData, lang);
-          source = 'fallback';
-          modelUsed = 'fallback-template';
-        }
-
-        let audioBase64: string | undefined;
-        if (generateAudio) {
-          try {
-            audioBase64 = await generatePokemonSpeech(analysisText);
-          } catch (e) {
-            console.error("Audio gen failed, continuing without audio.");
-          }
-        }
-
-        const responsePayload: AnalysisResponse = {
-          pokemonName: pokemonData.name,
-          text: analysisText,
-          audioBase64,
-          source,
-          modelUsed,
-          lang
-        };
-
-        this.cache.set(cacheKey, responsePayload);
-        
-        res.json({
-          raw: pokemonData,
-          enriched: responsePayload
-        });
-
-      } catch (error: any) {
-        console.error("Gateway Critical Error:", error);
-        res.status(500).json({ error: "Falha interna no Gateway", details: error.message });
-      }
-    });
+    // Rota /ai/speech removida (não será mais usada)
+    // Rota combinada (legado) removida
   }
 
   public start() {
