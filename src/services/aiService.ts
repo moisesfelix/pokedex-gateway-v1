@@ -1,8 +1,8 @@
 
 import { GoogleGenAI } from "@google/genai";
 import { PokemonDetails } from "../types";
-
-const getAI = () => new GoogleGenAI({ apiKey: 'AIzaSyB55i2vRV6LrEhfypBWKRXl35uyiB-pwvM' });
+const API_KEY = process.env.API_KEY;
+const getAI = () => new GoogleGenAI({ apiKey: API_KEY});
 export const getProfessorInsight = async (pokemon: PokemonDetails): Promise<string> => {
   const ai = getAI();
   
