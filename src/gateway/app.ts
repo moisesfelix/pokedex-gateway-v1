@@ -33,7 +33,10 @@ export class PokemonGateway {
   }
 
   private setupMiddleware() {
-    this.app.use(cors());
+    this.app.use(cors({
+      origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+      credentials: true
+    }));
     this.app.use(express.json());
 
     const limiter = rateLimit({

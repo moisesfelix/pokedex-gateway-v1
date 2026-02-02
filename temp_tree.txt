@@ -10,7 +10,8 @@ src/services/aiService.ts
 src/services/pokemonService.ts
 src/types.ts
 src/utils
+src/utils/errors.ts
 src/utils/fallback.ts
 src/utils/metrics.ts
 
-5 directories, 9 files
+5 directories, 10 files
